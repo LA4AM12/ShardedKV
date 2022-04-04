@@ -23,7 +23,23 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type HeartbeatRequest struct {
+}
 
+type HeartbeatResponse struct {
+	TaskId   int
+	JobType  JobType
+	FileName string
+	NReduce  int
+}
+
+type ReportRequest struct {
+	TaskId  int
+	JobType JobType
+}
+
+type ReportResponse struct {
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
