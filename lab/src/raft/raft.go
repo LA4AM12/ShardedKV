@@ -56,6 +56,7 @@ type ApplyMsg struct {
 //
 type Raft struct {
 	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
+	syncCond  []*sync.Cond        // signal replicator goroutine to batch replicating entries
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -212,9 +213,10 @@ type AppendEntriesArgs struct {
 //
 type AppendEntriesReply struct {
 	// Your data here (2A).
-	Term      int
-	Success   bool
-	NextIndex int
+	Term    int
+	Success bool
+	XTerm   int
+	XIndex  int
 }
 
 //
@@ -266,19 +268,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	lastLogIndex := rf.log[len(rf.log)-1].Index
 	if args.PrevLogIndex > lastLogIndex {
 		DPrintf("[AppendEntries] server %v doesn't contain an entry at prevLogIndex %v", rf.me, args.PrevLogIndex)
-		reply.Term, reply.Success, reply.NextIndex = rf.currentTerm, false, lastLogIndex+1
+		reply.Term, reply.Success, reply.XTerm, reply.XIndex = rf.currentTerm, false, -1, lastLogIndex+1
 		return
 	}
-	// If an existing entry conflicts with a new one (same index
-	// but different terms), delete the existing entry and all that follow it
+	// If an existing entry conflicts with a new one (same index but different terms)
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		conflictTerm, conflictIndex := rf.log[args.PrevLogIndex].Term, rf.log[args.PrevLogIndex].Index
 		DPrintf("[AppendEntries] server %v an existing entry(term %v) conflicts with a new one(term %v) at index %v", rf.me, conflictTerm, args.Term, conflictIndex)
-		for rf.log[conflictTerm-1].Term == conflictTerm {
+		for rf.log[conflictIndex-1].Term == conflictTerm {
 			conflictIndex--
 		}
-		rf.log = rf.log[:conflictIndex]
-		reply.Term, reply.Success, reply.NextIndex = rf.currentTerm, false, conflictIndex
+		// delete the existing entry and all that follow it
+		rf.log = rf.log[:args.PrevLogIndex]
+		reply.Term, reply.Success, reply.XTerm, reply.XIndex = rf.currentTerm, false, conflictTerm, conflictIndex
 		return
 	}
 	// Append any new entries not already in the log
@@ -367,21 +369,33 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.matchIndex[rf.me] = entry.Index
 	rf.nextIndex[rf.me] = rf.matchIndex[rf.me] + 1
 	for peer := range rf.peers {
-		if peer == rf.me {
-			continue
+		if peer != rf.me {
+			rf.syncCond[peer].Signal()
 		}
-		go rf.Sync(peer)
 	}
-
+	DPrintf("[Start] server %v append entry %v", rf.me, entry)
 	return entry.Index, entry.Term, true
+}
+
+func (rf *Raft) Replicator(peer int) {
+	rf.syncCond[peer].L.Lock()
+	defer rf.syncCond[peer].L.Unlock()
+	for !rf.killed() {
+		for rf.needSync(peer) {
+			rf.Sync(peer)
+		}
+		rf.syncCond[peer].Wait()
+	}
+}
+
+func (rf *Raft) needSync(peer int) bool {
+	rf.mu.RLock()
+	defer rf.mu.RUnlock()
+	return rf.state == Leader && rf.matchIndex[peer] < rf.log[len(rf.log)-1].Index
 }
 
 func (rf *Raft) Sync(peer int) {
 	rf.mu.RLock()
-	if rf.state != Leader {
-		rf.mu.RUnlock()
-		return
-	}
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
@@ -416,8 +430,21 @@ func (rf *Raft) Sync(peer int) {
 			rf.applyCommand()
 		}
 	} else {
-		rf.nextIndex[peer] = reply.NextIndex
-		go rf.Sync(peer)
+		if reply.XTerm == -1 {
+			rf.nextIndex[peer] = reply.XIndex
+		} else {
+			// TODO 持久化后需要注意越界
+			next := rf.nextIndex[peer] - 1
+			for rf.log[next-1].Term > reply.XTerm {
+				next--
+			}
+			// leader find XTerm
+			if rf.log[next-1].Term == reply.XTerm {
+				rf.nextIndex[peer] = next
+			} else {
+				rf.nextIndex[peer] = reply.XIndex
+			}
+		}
 	}
 }
 
@@ -531,7 +558,7 @@ func StableHeartbeatTimeout() time.Duration {
 
 func RandomizedElectionTimeout() time.Duration {
 	rand.Seed(time.Now().UnixNano())
-	d := rand.Intn(150) + 1000
+	d := rand.Intn(200) + 500
 	return time.Duration(d) * time.Millisecond
 }
 
@@ -558,15 +585,14 @@ func (rf *Raft) broadcastHeartbeat() {
 					return
 				}
 				rf.mu.Lock()
+				defer rf.mu.Unlock()
 				// stale term
 				if rf.currentTerm < reply.Term {
 					DPrintf("[Heartbeat] find a higher term[%v], {server %v} convert to follower", reply.Term, rf.me)
 					rf.convertToFollower(reply.Term)
-					rf.mu.Unlock()
 				} else {
 					DPrintf("[Heartbeat] follower %v need to sync", peer)
-					rf.mu.Unlock()
-					rf.Sync(peer)
+					rf.syncCond[peer].Signal()
 				}
 			}(peer)
 		}
@@ -576,10 +602,14 @@ func (rf *Raft) broadcastHeartbeat() {
 func (rf *Raft) convertToLeader() {
 	DPrintf("{server %v} convert to leader", rf.me)
 	rf.state, rf.votedFor = Leader, -1
-	rf.nextIndex, rf.matchIndex = make([]int, len(rf.peers)), make([]int, len(rf.peers))
 	lastLogEntry := rf.log[len(rf.log)-1]
-	for i := range rf.nextIndex {
-		rf.nextIndex[i] = lastLogEntry.Index + 1
+	for peer := range rf.peers {
+		rf.matchIndex[peer] = 0
+		rf.nextIndex[peer] = lastLogEntry.Index + 1
+		if rf.syncCond[peer] == nil && peer != rf.me {
+			rf.syncCond[peer] = sync.NewCond(&sync.Mutex{})
+			go rf.Replicator(peer)
+		}
 	}
 	rf.electionTimer.Stop()
 	rf.hbTicker = time.NewTicker(StableHeartbeatTimeout())
@@ -652,17 +682,19 @@ func (rf *Raft) startElection() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
-
-	// Your initialization code here (2A, 2B, 2C).
-	rf.state = Follower
-	rf.applyCh = applyCh
-	rf.votedFor = -1
-	rf.log = make([]Entry, 1)
-	rf.electionTimer = time.NewTimer(RandomizedElectionTimeout())
+	rf := &Raft{
+		syncCond:      make([]*sync.Cond, len(peers)),
+		peers:         peers,
+		persister:     persister,
+		me:            me,
+		state:         Follower,
+		applyCh:       applyCh,
+		electionTimer: time.NewTimer(RandomizedElectionTimeout()),
+		votedFor:      -1,
+		log:           make([]Entry, 1),
+		nextIndex:     make([]int, len(peers)),
+		matchIndex:    make([]int, len(peers)),
+	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
