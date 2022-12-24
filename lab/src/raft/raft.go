@@ -170,7 +170,6 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	snapshotIndex := rf.logs[0].Index
-	// if index >
 	if index <= snapshotIndex {
 		return
 	}
@@ -559,8 +558,11 @@ func (rf *Raft) syncUseSnapshot(peer int) {
 }
 
 func (rf *Raft) Sync(peer int) {
+	rf.mu.RLock()
 	prevLogIndex := rf.nextIndex[peer] - 1
-	if prevLogIndex < rf.logs[0].Index {
+	firstLogIndex := rf.logs[0].Index
+	rf.mu.RUnlock()
+	if prevLogIndex < firstLogIndex {
 		DPrintf("log can not catch up, prevLogIndex %v, to server %v", prevLogIndex, peer)
 		rf.syncUseSnapshot(peer)
 	} else {
