@@ -4,6 +4,7 @@ import (
 	"6.824/labgob"
 	"6.824/labrpc"
 	"6.824/raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -30,7 +31,12 @@ type Op struct {
 type OpContext struct {
 	ClientId    int64
 	OperationId int64
-	Reply       interface{}
+	Reply       Reply
+}
+
+type Reply struct {
+	Err   Err
+	Value string
 }
 
 type KVServer struct {
@@ -43,9 +49,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	notifyChs  map[int]chan OpContext
-	kvStore    map[string]string
-	lastOpMemo map[int64]OpContext
+	lastApplied int
+	notifyChs   map[int]chan OpContext
+	kvStore     map[string]string
+	lastOpMemo  map[int64]OpContext
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -59,8 +66,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	kv.mu.RLock()
 	if lastOp, ok := kv.isDuplicated(op); ok {
 		DPrintf("server %v received duplicated Get request for clientId %v OperationId %v", kv.me, args.ClientId, args.OperationId)
-		exReply := lastOp.Reply.(GetReply)
-		reply.Err, reply.Value = exReply.Err, exReply.Value
+		reply.Err, reply.Value = lastOp.Reply.Err, lastOp.Reply.Value
 		kv.mu.RUnlock()
 		return
 	}
@@ -83,12 +89,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			reply.Err = ErrWrongLeader
 			return
 		}
-		re := opContext.Reply.(GetReply)
-		reply.Err, reply.Value = re.Err, re.Value
+		reply.Err, reply.Value = opContext.Reply.Err, opContext.Reply.Value
 	case <-time.After(time.Duration(Timeout) * time.Millisecond):
 		reply.Err = ErrTimeout
 		DPrintf("Get timeout : server %v clientId %v operationId %v", kv.me, args.ClientId, args.OperationId)
 	}
+
+	go func() {
+		kv.mu.Lock()
+		delete(kv.notifyChs, index)
+		kv.mu.Unlock()
+	}()
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -103,7 +114,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.RLock()
 	if lastOp, ok := kv.isDuplicated(op); ok {
 		DPrintf("server %v received duplicated %v request for clientId %v OperationId %v", kv.me, args.Op, args.ClientId, args.OperationId)
-		reply.Err = lastOp.Reply.(PutAppendReply).Err
+		reply.Err = lastOp.Reply.Err
 		kv.mu.RUnlock()
 		return
 	}
@@ -126,11 +137,17 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			reply.Err = ErrWrongLeader
 			return
 		}
-		reply.Err = (opContext.Reply).(PutAppendReply).Err
+		reply.Err = opContext.Reply.Err
 	case <-time.After(time.Duration(Timeout) * time.Millisecond):
 		reply.Err = ErrTimeout
 		DPrintf("PutAppend timeout : server %v clientId %v operationId %v", kv.me, args.ClientId, args.OperationId)
 	}
+
+	go func() {
+		kv.mu.Lock()
+		delete(kv.notifyChs, index)
+		kv.mu.Unlock()
+	}()
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -155,8 +172,12 @@ func (kv *KVServer) killed() bool {
 func (kv *KVServer) applier() {
 	for !kv.killed() {
 		applyMsg := <-kv.applyCh
+		kv.mu.Lock()
 		if applyMsg.CommandValid {
-			kv.mu.Lock()
+			if applyMsg.CommandIndex <= kv.lastApplied {
+				kv.mu.Unlock()
+				continue
+			}
 			op := applyMsg.Command.(Op)
 			var opContext OpContext
 			if lastOp, ok := kv.isDuplicated(op); ok {
@@ -164,13 +185,22 @@ func (kv *KVServer) applier() {
 			} else {
 				opContext = kv.applyOp(op)
 				kv.lastOpMemo[op.ClientId] = opContext
+				kv.lastApplied = applyMsg.CommandIndex
 			}
 			if notifyCh, ok := kv.notifyChs[applyMsg.CommandIndex]; ok {
 				notifyCh <- opContext
-				delete(kv.notifyChs, applyMsg.CommandIndex)
 			}
-			kv.mu.Unlock()
+			if kv.needSnapshot() {
+				kv.takeSnapshot(applyMsg.CommandIndex)
+			}
+		} else if applyMsg.SnapshotValid {
+			if applyMsg.SnapshotIndex <= kv.lastApplied {
+				kv.mu.Unlock()
+				continue
+			}
+			kv.applySnapshots(applyMsg.Snapshot)
 		}
+		kv.mu.Unlock()
 	}
 }
 
@@ -182,12 +212,12 @@ func (kv *KVServer) applyOp(op Op) OpContext {
 	switch op.Type {
 	case OpPut:
 		kv.kvStore[op.Key] = op.Value
-		opContext.Reply = PutAppendReply{OK}
+		opContext.Reply = Reply{Err: OK}
 	case OpAppend:
 		kv.kvStore[op.Key] += op.Value
-		opContext.Reply = PutAppendReply{OK}
+		opContext.Reply = Reply{Err: OK}
 	case OpGet:
-		reply := GetReply{}
+		reply := Reply{}
 		if _, ok := kv.kvStore[op.Key]; !ok {
 			reply.Err = ErrNoKey
 		} else {
@@ -206,6 +236,43 @@ func (kv *KVServer) isDuplicated(op Op) (OpContext, bool) {
 		return lastOp, true
 	}
 	return OpContext{}, false
+}
+
+func (kv *KVServer) needSnapshot() bool {
+	DPrintf("server %v RaftStateSize %v", kv.me, kv.rf.RaftStateSize())
+	if kv.maxraftstate != -1 && kv.rf.RaftStateSize() >= kv.maxraftstate {
+		return true
+	}
+	return false
+}
+
+func (kv *KVServer) takeSnapshot(index int) {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.kvStore)
+	e.Encode(kv.lastOpMemo)
+	e.Encode(kv.lastApplied)
+
+	kv.rf.Snapshot(index, w.Bytes())
+}
+
+func (kv *KVServer) applySnapshots(data []byte) {
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var kvStore map[string]string
+	var lastOpMemo map[int64]OpContext
+	var lastApplied int
+	if d.Decode(&kvStore) != nil || d.Decode(&lastOpMemo) != nil || d.Decode(&lastApplied) != nil {
+		DPrintf("server %d decode error", kv.me)
+	} else {
+		kv.kvStore = kvStore
+		kv.lastOpMemo = lastOpMemo
+		kv.lastApplied = lastApplied
+	}
 }
 
 // servers[] contains the ports of the set of
@@ -238,6 +305,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kvStore = make(map[string]string)
 	kv.notifyChs = make(map[int]chan OpContext)
 	kv.lastOpMemo = make(map[int64]OpContext)
+	kv.lastApplied = 0
+	kv.applySnapshots(persister.ReadSnapshot())
+
 	go kv.applier()
 	return kv
 }
