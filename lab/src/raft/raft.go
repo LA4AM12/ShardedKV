@@ -239,8 +239,6 @@ type InstallSnapshotReply struct {
 // InstallSnapshot RPC handler.
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		return
@@ -266,13 +264,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// catch up
 	rf.lastApplied, rf.commitIndex = args.LastIncludedIndex, args.LastIncludedIndex
 	rf.persister.SaveStateAndSnapshot(rf.encodeState(), args.Data)
+	rf.mu.Unlock()
 	rf.applyCh <- ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Data,
 		SnapshotTerm:  args.LastIncludedTerm,
 		SnapshotIndex: args.LastIncludedIndex,
 	}
-
 	DPrintf("[InstallSnapshot] server %v catch up, commitIndex %v", rf.me, args.LastIncludedIndex)
 }
 
